@@ -1,0 +1,159 @@
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
+from . import cache, identity, storage
+from .config import settings
+from .controllers import (
+    auth_controller,
+    author_controller,
+    catalog_controller,
+    genre_controller,
+    library_controller,
+    physical_book_controller,
+    reservation_controller,
+    user_controller,
+)
+from .persistence import search
+from .persistence.errors import ConditionFailedError, SearchUnavailableError
+from .services.errors import (
+    AuthUnavailableError,
+    ConflictError,
+    ForbiddenError,
+    NotFoundError,
+    UnauthorizedError,
+)
+
+async def limit_request_size(request: Request, call_next):
+    """Rechaza con 413 un cuerpo más grande que `MAX_REQUEST_BYTES`.
+
+    Ni FastAPI ni uvicorn traen un tope propio, así que sin esto un POST de 1 GB se
+    bufferea entero en memoria antes de que Pydantic pueda rechazarlo por longitud: el
+    proceso se queda sin RAM validando algo que igual iba a dar 422.
+
+    Se mira el `Content-Length` y no el cuerpo: cortar antes de leerlo es justamente el
+    punto. Un cliente que no manda el header (`Transfer-Encoding: chunked`) esquiva este
+    control; el tope duro de ese caso lo pone el proxy de adelante (API Gateway corta en
+    10 MB, y el ALB tiene su propio límite).
+    """
+    declared = request.headers.get("content-length")
+    if declared is not None and declared.isdigit() and int(declared) > settings.max_request_bytes:
+        return JSONResponse(
+            status_code=413,
+            content={
+                "detail": (
+                    f"El cuerpo del request no puede superar "
+                    f"{settings.max_request_bytes // 1024} KB."
+                )
+            },
+        )
+    return await call_next(request)
+
+
+def handle_not_found(request: Request, exc: NotFoundError) -> JSONResponse:
+    return JSONResponse(status_code=404, content={"detail": str(exc)})
+
+
+def handle_conflict(request: Request, exc: ConflictError) -> JSONResponse:
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+
+def handle_condition_failed(request: Request, exc: ConditionFailedError) -> JSONResponse:
+    # Red de seguridad: un service que no atrapó la escritura condicional que perdió igual
+    # contesta 409 (el contrato) y no 500. Cubre también `AlreadyExistsError`.
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+
+def handle_search_unavailable(request: Request, exc: SearchUnavailableError) -> JSONResponse:
+    # Solo el catálogo con filtros y la búsqueda dependen del índice; el resto de la API
+    # sigue sirviendo. Un 503 (y no un 500) le dice al cliente que reintente.
+    return JSONResponse(status_code=503, content={"detail": str(exc)}, headers={"Retry-After": "5"})
+
+
+def handle_unauthorized(request: Request, exc: UnauthorizedError) -> JSONResponse:
+    return JSONResponse(
+        status_code=401,
+        content={"detail": str(exc)},
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+def handle_auth_unavailable(request: Request, exc: AuthUnavailableError) -> JSONResponse:
+    # El JWKS de Cognito no contesta: el token puede ser válido. Un 401 haría que el
+    # frontend tire la sesión por un problema que no es de quien llama.
+    return JSONResponse(status_code=503, content={"detail": str(exc)}, headers={"Retry-After": "5"})
+
+
+def handle_forbidden(request: Request, exc: ForbiddenError) -> JSONResponse:
+    return JSONResponse(status_code=403, content={"detail": str(exc)})
+
+
+def handle_identity_unavailable(
+    request: Request, exc: identity.IdentityUnavailableError
+) -> JSONResponse:
+    # La API de administración de Cognito (alta y baja de cuentas) no contesta.
+    return JSONResponse(status_code=503, content={"detail": str(exc)}, headers={"Retry-After": "5"})
+
+
+def health():
+    # `cache`, `storage` y `search` son informativos: la API sirve todo igual con Redis caído,
+    # sin bucket o sin el índice (solo `GET /books` con filtros, `/books/search` y
+    # `/books/cities` dejan de responder), así que un `down` acá no baja el status general ni
+    # saca la instancia del target group.
+    return {
+        "status": "ok",
+        "cache": cache.health(),
+        "storage": storage.health(),
+        "search": search.health(),
+    }
+
+
+_EXCEPTION_HANDLERS = {
+    NotFoundError: handle_not_found,
+    ConflictError: handle_conflict,
+    ConditionFailedError: handle_condition_failed,
+    SearchUnavailableError: handle_search_unavailable,
+    UnauthorizedError: handle_unauthorized,
+    AuthUnavailableError: handle_auth_unavailable,
+    ForbiddenError: handle_forbidden,
+    identity.IdentityUnavailableError: handle_identity_unavailable,
+}
+
+
+def create_app() -> FastAPI:
+    """La app, según `settings.auth_mode`.
+
+    Los endpoints que existen solo en un modo se **montan** o no, en vez de contestar 404 a
+    mano: así `/docs` y `/openapi.json` muestran la API real de ese modo. Con Cognito no hay
+    `POST /auth/login` (el token lo da la Hosted UI) ni `POST /users` (el registro es la
+    Hosted UI más el trigger), y con ellos se va su rate limiting: Cognito trae el suyo.
+    """
+    app = FastAPI(title="BookUp API", version="0.1.0")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origins,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    app.middleware("http")(limit_request_size)
+    for exc_class, handler in _EXCEPTION_HANDLERS.items():
+        app.add_exception_handler(exc_class, handler)
+
+    if settings.auth_mode == "local":
+        app.include_router(auth_controller.login_router)
+    app.include_router(auth_controller.router)
+    app.include_router(catalog_controller.router)
+    app.include_router(author_controller.router)
+    app.include_router(genre_controller.router)
+    app.include_router(physical_book_controller.router)
+    app.include_router(library_controller.router)
+    app.include_router(reservation_controller.router)
+    # `signup_router` antes que `router`: comparten el prefijo `/users`.
+    if settings.auth_mode == "local":
+        app.include_router(user_controller.signup_router)
+    app.include_router(user_controller.router)
+    app.get("/health")(health)
+    return app
+
+
+app = create_app()

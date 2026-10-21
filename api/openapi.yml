@@ -1,0 +1,2206 @@
+openapi: 3.0.3
+info:
+  title: BookUp API
+  description: >
+    API del MVP de BookUp: catálogo de libros, sedes de biblioteca, reservas de
+    ejemplares físicos y usuarios. Generado a partir del código en
+    `api/app/controllers/` (routers FastAPI) y `api/app/controllers/schemas.py`.
+
+
+    **Consistencia.** La fuente de verdad es DynamoDB, y todo lo que se lee por clave
+    (`GET /books/{isbn}`, `/books/{isbn}/availability`, las respuestas de los `POST` y
+    `PATCH`, reservas, usuarios) es consistente: se ve lo que se acaba de escribir. Solo el
+    **listado del catálogo** (`GET /books`, `/books/search`, `/books/cities`) sale de un
+    índice de búsqueda que se alimenta del stream de la tabla, así que es **eventualmente
+    consistente**: un cambio tarda en aparecer ~1 segundo. Si el índice no está disponible,
+    esos tres endpoints dan 503 y el resto de la API sigue funcionando.
+
+
+    **Autenticación.** Quién emite el token depende de `AUTH_MODE`:
+
+    - `local` (desarrollo y tests): la API misma, con `POST /auth/login` (JWT HS256 firmado
+      con `JWT_SECRET`). El auto-registro es `POST /users`.
+
+    - `cognito` (AWS): un User Pool de Cognito. El token se obtiene en la Hosted UI y llega al
+      navegador por el puente HTTPS (`auth-bridge/`); la API solo lo **valida** (RS256 contra
+      el JWKS del pool). En este modo `POST /auth/login` y `POST /users` **no se montan**
+      (404): el registro es la Hosted UI más el trigger Post Confirmation.
+
+    En los dos modos el rol y la sede salen del `User` de la base en cada request, no del
+    token. Este documento describe la unión de los dos modos; `/docs` y `/openapi.json` de una
+    instancia en marcha muestran solo los endpoints de su modo. Ver `COGNITO_ROADMAP.md`.
+  version: "0.1.0"
+servers:
+  - url: http://localhost:8000
+    description: Desarrollo local
+
+tags:
+  - name: auth
+    description: >
+      Login (solo `AUTH_MODE=local`) y datos del usuario autenticado
+  - name: catalog
+    description: >
+      Catálogo de libros. Lectura pública; la escritura requiere
+      `librarian`/`sysadmin`. El detalle de un libro y su disponibilidad se leen de la
+      base y son consistentes; el listado, la búsqueda y las ciudades se leen de un índice
+      de búsqueda y se actualizan ~1 s después de cada escritura.
+  - name: authors
+    description: Autores del catálogo
+  - name: genres
+    description: Géneros del catálogo
+  - name: physical_books
+    description: Ejemplares físicos de un libro en una sede
+  - name: libraries
+    description: Sedes de biblioteca
+  - name: reservations
+    description: >
+      Reservas de ejemplares físicos. No hay un enum de estado: una reserva está
+      **abierta** mientras `cancelled_at` y `returned_at` sean null, y
+      `picked_up` distingue las dos etapas abiertas (reservado / prestado).
+      Cerrarla es lo que libera el ejemplar — `cancelled_at` si se dio de baja
+      antes del retiro (por el usuario, por la sede o por vencimiento),
+      `returned_at` cuando vuelve un ejemplar ya retirado. El ciclo completo es
+      `available → reserved → loaned → available`, con salida a `available` por
+      cancelación desde `reserved`, y a `lost` en cualquier punto.
+  - name: users
+    description: Usuarios (clientes, bibliotecarios, sysadmins)
+  - name: health
+    description: Chequeo de salud del servicio
+
+paths:
+  /auth/login:
+    post:
+      tags: [auth]
+      summary: Obtener un token de acceso (solo `AUTH_MODE=local`)
+      description: >
+        **Solo con `AUTH_MODE=local`**; con `AUTH_MODE=cognito` no existe (404) y el token
+        lo da la Hosted UI de Cognito.
+
+
+        Valida email + password y devuelve un JWT firmado (HS256) con el id, el
+        rol y la sede del usuario. Responde 401 tanto si el email no existe como
+        si la password es incorrecta, para no filtrar qué emails están
+        registrados.
+
+
+        **Rate limit**: se cuentan los intentos por IP (antes de autenticar, porque
+        comparar un hash de bcrypt es caro) y los intentos **fallidos** por cuenta
+        (después, para que nadie pueda dejar afuera al dueño de la cuenta errándole la
+        contraseña a propósito: la contraseña correcta siempre entra). Al pasarse, 429
+        con `Retry-After`.
+      operationId: login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: Token emitido
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenOut"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /auth/me:
+    get:
+      tags: [auth]
+      summary: Datos del usuario autenticado
+      operationId: getCurrentUser
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Usuario autenticado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserOut"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /health:
+    get:
+      tags: [health]
+      summary: Health check
+      operationId: health
+      responses:
+        "200":
+          description: El servicio está operativo
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, cache, storage, search]
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  cache:
+                    type: string
+                    enum: [ok, down, disabled]
+                    description: >
+                      Redis. Informativo, con `down` la API sirve igual, desde la base.
+                  storage:
+                    type: string
+                    enum: [ok, down, disabled]
+                    description: >
+                      Bucket de portadas. Informativo, sin él solo fallan los endpoints de
+                      portada.
+                  search:
+                    type: string
+                    enum: [ok, down, disabled]
+                    description: >
+                      Índice de búsqueda del catálogo. Informativo, sin él `GET /books`,
+                      `/books/search` y `/books/cities` dan 503 y el resto sigue andando.
+                      Ninguno de los tres baja el `status` general.
+
+  /books:
+    get:
+      tags: [catalog]
+      summary: Listar el catálogo paginado, con búsqueda y filtros
+      description: >
+        Devuelve una página del catálogo ordenada por título, junto con el `total`
+        que matchea (no el de la página). Buscar y filtrar son la misma operación:
+        `q` es un filtro más y todos se combinan.
+
+
+        Repetir un parámetro suma valores (`genre_id=1&genre_id=2` = "novela **o**
+        cuento"); parámetros distintos se acumulan ("novela **y** en Rosario").
+
+
+        `city` significa **reservable hoy ahí**: el libro tiene al menos un ejemplar
+        en estado `available` en una sede de esa ciudad. Por eso su resultado cambia
+        con cada reserva.
+
+
+        **Eventualmente consistente.** El listado sale del índice de búsqueda, que se
+        actualiza ~1 segundo después de cada escritura (crear un libro, reservar,
+        cancelar, renombrar un autor...). El `POST` que creó un libro devuelve la entidad
+        completa de inmediato, y `GET /books/{isbn}` también; el listado lo incluye un
+        instante después. Da 503 si el índice no está disponible.
+      operationId: listBooks
+      parameters:
+        - name: q
+          in: query
+          required: false
+          description: >
+            Texto libre sobre título, ISBN, sinopsis y nombre de autor. Sin distinguir
+            mayúsculas ni tildes («garcia marquez» encuentra «García Márquez»). Se piden
+            **todas** las palabras, y solo la última puede estar a medias («borg» encuentra
+            «Borges»; «jor luis borges» no). La entrada es texto, nunca sintaxis: `%`, `*`,
+            `OR`, `~` o `title:` no tienen ningún significado especial.
+          schema: { type: string, minLength: 1, maxLength: 200 }
+        - name: author_id
+          in: query
+          required: false
+          description: Repetible hasta 20 veces; suma autores (OR).
+          schema:
+            type: array
+            maxItems: 20
+            items: { type: integer }
+        - name: genre_id
+          in: query
+          required: false
+          description: Repetible hasta 20 veces; suma géneros (OR).
+          schema:
+            type: array
+            maxItems: 20
+            items: { type: integer }
+        - name: city
+          in: query
+          required: false
+          description: Repetible hasta 20 veces; suma ciudades (OR). Solo cuenta el stock disponible.
+          schema:
+            type: array
+            maxItems: 20
+            items: { type: string, minLength: 1, maxLength: 100 }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - name: offset
+          in: query
+          required: false
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        "200":
+          description: Página del catálogo
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BookPage"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "503":
+          $ref: "#/components/responses/SearchUnavailable"
+    post:
+      tags: [catalog]
+      summary: Crear un libro en el catálogo
+      description: >
+        Requiere `librarian` o `sysadmin`. El `isbn` tiene que ser un ISBN-13
+        válido (13 dígitos y dígito verificador correcto), si no da 422.
+        `author_ids`/`genre_ids` referencian autores y géneros ya existentes:
+        si alguno no existe, 404.
+      operationId: createBook
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BookCreate"
+      responses:
+        "201":
+          description: Libro creado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BookOut"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /books/cities:
+    get:
+      tags: [catalog]
+      summary: Ciudades con stock disponible
+      description: >
+        Las opciones del filtro `city` de `GET /books`: solo las ciudades que hoy
+        tienen al menos un ejemplar disponible. Sale del índice de búsqueda (eventualmente
+        consistente, ~1 s); da 503 si no está disponible.
+      operationId: listCities
+      responses:
+        "200":
+          description: Ciudades, ordenadas alfabéticamente
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { type: string }
+                example: ["Buenos Aires", "Córdoba", "Rosario"]
+        "503":
+          $ref: "#/components/responses/SearchUnavailable"
+
+  /books/search:
+    get:
+      tags: [catalog]
+      summary: Buscar libros por texto libre
+      description: >
+        Búsqueda por título, ISBN, autor y sinopsis sobre el índice de búsqueda
+        (OpenSearch): sin distinguir mayúsculas ni tildes, con todas las palabras
+        presentes y la última admitida a medias. Devuelve hasta 50 libros, los más
+        relevantes primero. Eventualmente consistente (~1 s); da 503 si el índice no está
+        disponible.
+      operationId: searchBooks
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 200
+      responses:
+        "200":
+          description: Libros que matchean la búsqueda
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/BookOut"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "503":
+          $ref: "#/components/responses/SearchUnavailable"
+
+  /books/{isbn}:
+    get:
+      tags: [catalog]
+      summary: Obtener un libro por ISBN
+      description: >
+        Se lee directo de la base: es consistente, un libro recién creado se ve de
+        inmediato (a diferencia del listado, que sale del índice de búsqueda).
+      operationId: getBook
+      parameters:
+        - $ref: "#/components/parameters/IsbnPath"
+      responses:
+        "200":
+          description: Libro encontrado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BookOut"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      tags: [catalog]
+      summary: Actualizar un libro
+      description: >
+        Requiere `librarian` o `sysadmin`. Actualización parcial; solo se
+        aplican los campos enviados. Enviar `author_ids`/`genre_ids`
+        **reemplaza** la lista completa (mandar `[]` la vacía); omitirlos la
+        deja como estaba.
+      operationId: updateBook
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/IsbnPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BookUpdate"
+      responses:
+        "200":
+          description: Libro actualizado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BookOut"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+    delete:
+      tags: [catalog]
+      summary: Eliminar un libro del catálogo
+      description: >
+        Requiere `librarian` o `sysadmin`. Falla con 409 si el libro todavía
+        tiene ejemplares físicos en alguna sede.
+      operationId: deleteBook
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/IsbnPath"
+      responses:
+        "204":
+          description: Libro eliminado
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /books/{isbn}/cover-upload:
+    post:
+      tags: [catalog]
+      summary: Firmar la subida de una portada
+      description: >
+        Requiere `librarian` o `sysadmin`. Devuelve una URL firmada para que el cliente
+        haga `PUT` del archivo **directo al bucket**: la imagen no pasa por la API.
+        Después hay que confirmar la key con `PUT /books/{isbn}/cover`.
+        Da 503 si el almacenamiento de portadas no está configurado.
+      operationId: requestCoverUpload
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: isbn
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CoverUploadRequest"
+      responses:
+        "200":
+          description: URL firmada
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CoverUploadOut"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "503":
+          description: El almacenamiento de portadas no está configurado
+
+  /books/{isbn}/cover:
+    put:
+      tags: [catalog]
+      summary: Confirmar la portada subida
+      description: >
+        Requiere `librarian` o `sysadmin`. Valida que la key sea del prefijo de este
+        libro y que el objeto exista en el bucket antes de guardarla; si el libro ya
+        tenía portada, la anterior se borra. Da 503 si el almacenamiento no está
+        configurado.
+      operationId: attachCover
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: isbn
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CoverAttach"
+      responses:
+        "200":
+          description: Libro con la portada ya asociada
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BookOut"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "503":
+          description: El almacenamiento de portadas no está configurado
+    delete:
+      tags: [catalog]
+      summary: Quitar la portada de un libro
+      description: Requiere `librarian` o `sysadmin`. Borra el objeto del bucket.
+      operationId: removeCover
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: isbn
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Libro sin portada
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BookOut"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /books/{isbn}/availability:
+    get:
+      tags: [catalog]
+      summary: Disponibilidad de un libro por sede
+      description: >
+        Agrupa los ejemplares físicos (`PhysicalBook`) disponibles del libro
+        por sede, e informa un `physical_book_id` representativo listo para
+        reservar en cada sede.
+      operationId: getBookAvailability
+      parameters:
+        - $ref: "#/components/parameters/IsbnPath"
+      responses:
+        "200":
+          description: Disponibilidad por sede
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BookAvailability"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /authors:
+    get:
+      tags: [authors]
+      summary: Listar autores
+      operationId: listAuthors
+      responses:
+        "200":
+          description: Lista de autores
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/AuthorOut"
+    post:
+      tags: [authors]
+      summary: Crear un autor
+      description: >
+        Requiere `librarian` o `sysadmin`. `Author.name` no es único en el
+        modelo: se permiten homónimos (dos autores distintos pueden llamarse
+        igual) y la identidad es el `id`, así que crear el mismo nombre dos
+        veces devuelve dos autores distintos, no un 409.
+      operationId: createAuthor
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AuthorCreate"
+      responses:
+        "201":
+          description: Autor creado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthorOut"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /authors/{author_id}:
+    get:
+      tags: [authors]
+      summary: Obtener un autor por id
+      operationId: getAuthor
+      parameters:
+        - $ref: "#/components/parameters/AuthorIdPath"
+      responses:
+        "200":
+          description: Autor encontrado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthorOut"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      tags: [authors]
+      summary: Actualizar un autor
+      description: Requiere `librarian` o `sysadmin`.
+      operationId: updateAuthor
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/AuthorIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AuthorUpdate"
+      responses:
+        "200":
+          description: Autor actualizado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthorOut"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+    delete:
+      tags: [authors]
+      summary: Eliminar un autor
+      description: >
+        Requiere `librarian` o `sysadmin`. Falla con 409 si el autor todavía
+        está asociado a algún libro.
+      operationId: deleteAuthor
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/AuthorIdPath"
+      responses:
+        "204":
+          description: Autor eliminado
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /genres:
+    get:
+      tags: [genres]
+      summary: Listar géneros
+      operationId: listGenres
+      responses:
+        "200":
+          description: Lista de géneros
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/GenreOut"
+    post:
+      tags: [genres]
+      summary: Crear un género
+      description: >
+        Requiere `librarian` o `sysadmin`. A diferencia de los autores,
+        `Genre.name` **sí** es único: un nombre repetido da 409.
+      operationId: createGenre
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GenreCreate"
+      responses:
+        "201":
+          description: Género creado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenreOut"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /genres/{genre_id}:
+    get:
+      tags: [genres]
+      summary: Obtener un género por id
+      operationId: getGenre
+      parameters:
+        - $ref: "#/components/parameters/GenreIdPath"
+      responses:
+        "200":
+          description: Género encontrado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenreOut"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      tags: [genres]
+      summary: Actualizar un género
+      description: Requiere `librarian` o `sysadmin`. 409 si el nombre ya lo usa otro género.
+      operationId: updateGenre
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/GenreIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GenreUpdate"
+      responses:
+        "200":
+          description: Género actualizado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenreOut"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+    delete:
+      tags: [genres]
+      summary: Eliminar un género
+      description: >
+        Requiere `librarian` o `sysadmin`. Falla con 409 si el género todavía
+        está asociado a algún libro.
+      operationId: deleteGenre
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/GenreIdPath"
+      responses:
+        "204":
+          description: Género eliminado
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /physical-books:
+    get:
+      tags: [physical_books]
+      summary: Listar ejemplares físicos
+      operationId: listPhysicalBooks
+      parameters:
+        - name: isbn
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: library_id
+          in: query
+          required: false
+          schema:
+            type: integer
+        - name: status
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/PhysicalBookStatus"
+      responses:
+        "200":
+          description: Lista de ejemplares
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/PhysicalBookOut"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+    post:
+      tags: [physical_books]
+      summary: Dar de alta un ejemplar en una sede
+      description: >
+        Requiere `sysadmin`, o el `librarian` de **esa** sede. El ejemplar nace
+        en estado `available`. 404 si el libro o la sede no existen.
+      operationId: createPhysicalBook
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PhysicalBookCreate"
+      responses:
+        "201":
+          description: Ejemplar creado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PhysicalBookOut"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /physical-books/{physical_book_id}:
+    get:
+      tags: [physical_books]
+      summary: Obtener un ejemplar por id
+      operationId: getPhysicalBook
+      parameters:
+        - $ref: "#/components/parameters/PhysicalBookIdPath"
+      responses:
+        "200":
+          description: Ejemplar encontrado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PhysicalBookOut"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [physical_books]
+      summary: Dar de baja un ejemplar
+      description: >
+        Requiere `sysadmin`, o el `librarian` de la sede que lo tiene. Falla con
+        409 si el ejemplar tiene **cualquier** reserva asociada, incluidas las ya
+        cerradas: el historial de préstamos las referencia. Para sacar de
+        circulación un ejemplar que ya circuló, marcalo `lost`.
+      operationId: deletePhysicalBook
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PhysicalBookIdPath"
+      responses:
+        "204":
+          description: Ejemplar eliminado
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /physical-books/{physical_book_id}/status:
+    patch:
+      tags: [physical_books]
+      summary: Cambiar el estado de un ejemplar
+      description: >
+        Requiere `sysadmin`, o el `librarian` de la sede que lo tiene. Solo
+        admite `available` y `lost` como destino: pedir `reserved` o `loaned` da
+        409 porque esos estados los maneja el flujo de reservas.
+        `lost` se puede marcar en cualquier momento, incluso sobre un ejemplar
+        reservado o prestado — la reserva abierta se cierra sola
+        (`returned_at` si ya estaba retirado, `cancelled_at` si no).
+        Volver a `available`, en cambio, solo sale de `lost`: un ejemplar
+        `reserved`/`loaned` da 409, porque liberarlo es tarea de
+        `POST /reservations/{id}/cancel` o `PATCH /reservations/{id}/return`.
+      operationId: updatePhysicalBookStatus
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PhysicalBookIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PhysicalBookStatusUpdate"
+      responses:
+        "200":
+          description: Ejemplar actualizado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PhysicalBookOut"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /libraries:
+    get:
+      tags: [libraries]
+      summary: Listar sedes de biblioteca
+      operationId: listLibraries
+      responses:
+        "200":
+          description: Lista de sedes
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/LibraryOut"
+    post:
+      tags: [libraries]
+      summary: Crear una sede de biblioteca
+      description: Solo `sysadmin`.
+      operationId: createLibrary
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LibraryCreate"
+      responses:
+        "201":
+          description: Sede creada
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LibraryOut"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /libraries/{library_id}:
+    get:
+      tags: [libraries]
+      summary: Obtener una sede por id
+      operationId: getLibrary
+      parameters:
+        - $ref: "#/components/parameters/LibraryIdPath"
+      responses:
+        "200":
+          description: Sede encontrada
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LibraryOut"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      tags: [libraries]
+      summary: Actualizar una sede
+      description: >
+        Actualización parcial; solo se aplican los campos enviados. Un campo
+        enviado en `null` se ignora (no borra el valor existente).
+        Requiere `sysadmin`, o el `librarian` a cargo de **esta** sede.
+      operationId: updateLibrary
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/LibraryIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LibraryUpdate"
+      responses:
+        "200":
+          description: Sede actualizada
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LibraryOut"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+    delete:
+      tags: [libraries]
+      summary: Eliminar una sede
+      description: >
+        Solo `sysadmin`. Falla con 409 si la sede todavía tiene ejemplares
+        físicos asociados, para no dejarlos huérfanos.
+      operationId: deleteLibrary
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/LibraryIdPath"
+      responses:
+        "204":
+          description: Sede eliminada
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /reservations:
+    post:
+      tags: [reservations]
+      summary: Crear una reserva
+      description: >
+        Reserva un ejemplar físico puntual (`physical_book_id`) **a nombre del
+        usuario autenticado**: el dueño de la reserva sale del token, ya no del
+        body. Falla con 404 si el ejemplar no existe, y con 409 si el ejemplar
+        no está `available` (ya reservado, prestado o perdido). Al crearse, el
+        ejemplar pasa a estado `reserved`. `expires_at` tiene que ser futuro
+        (422 si no lo es).
+      operationId: createReservation
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReservationCreate"
+      responses:
+        "201":
+          description: Reserva creada
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReservationOut"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+    get:
+      tags: [reservations]
+      summary: Listar reservas
+      description: >
+        El alcance depende del rol: un `sysadmin` ve todas, un `librarian` solo
+        las de su sede (pedir otra da 403), y un `customer` solo las propias.
+        `mine=true` cambia ese alcance por "las reservas del usuario del token",
+        sin importar el rol: es la única forma de que un `librarian` o un
+        `sysadmin` liste las suyas, porque el alcance por rol se las acotaría a
+        su sede (o a todas). No expone nada nuevo — el dueño de una reserva ya
+        puede leerla con `GET /reservations/{id}`.
+      operationId: listReservations
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: library_id
+          in: query
+          required: false
+          schema:
+            type: integer
+          description: Filtra las reservas por sede (a través del ejemplar físico).
+        - name: is_open
+          in: query
+          required: false
+          schema:
+            type: boolean
+          description: >
+            `true` devuelve solo las reservas abiertas, `false` solo las ya
+            cerradas (canceladas o devueltas). Omitirlo devuelve el historial completo.
+        - name: mine
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+          description: >
+            `true` devuelve las reservas del usuario autenticado, cualquiera sea
+            su rol, ignorando el alcance por rol. Se puede combinar con
+            `library_id` e `is_open`.
+      responses:
+        "200":
+          description: Lista de reservas
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ReservationOut"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /reservations/expire:
+    post:
+      tags: [reservations]
+      summary: Vencer las reservas no retiradas
+      description: >
+        Solo `sysadmin`. Cierra (con `cancelled_at`) las reservas abiertas cuyo
+        `expires_at` ya pasó y que nunca se retiraron, y devuelve sus ejemplares
+        a `available`. Un préstamo vencido (ya retirado) no se toca: eso es otro
+        problema. Es idempotente — pensado para un cron/EventBridge.
+      operationId: expireReservations
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Cantidad de reservas vencidas en esta corrida
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExpiredReservations"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /reservations/{reservation_id}:
+    get:
+      tags: [reservations]
+      summary: Obtener una reserva por id
+      description: >
+        Accesible para el dueño de la reserva, el `librarian` de la sede que
+        tiene el ejemplar, o un `sysadmin`.
+      operationId: getReservation
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ReservationIdPath"
+      responses:
+        "200":
+          description: Reserva encontrada
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReservationOut"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      tags: [reservations]
+      summary: Extender el vencimiento de una reserva
+      description: >
+        Requiere ser el `librarian` de la sede que tiene el ejemplar, o un
+        `sysadmin`. `expires_at` tiene que ser futuro (422). Falla con 409 si la
+        reserva ya está cerrada o si el ejemplar ya fue retirado.
+      operationId: updateReservation
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ReservationIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReservationUpdate"
+      responses:
+        "200":
+          description: Reserva actualizada
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReservationOut"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /reservations/{reservation_id}/cancel:
+    post:
+      tags: [reservations]
+      summary: Cancelar una reserva
+      description: >
+        Cierra la reserva con `cancelled_at` (la fila se conserva, no se borra) y
+        devuelve el ejemplar a `available`. Accesible para el dueño de la
+        reserva, el `librarian` de la sede, o un `sysadmin`. Falla con 409 si la
+        reserva ya está cerrada, o si el ejemplar ya fue retirado — en ese caso
+        corresponde `PATCH /reservations/{id}/return`.
+      operationId: cancelReservation
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ReservationIdPath"
+      responses:
+        "200":
+          description: Reserva cancelada
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReservationOut"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /reservations/{reservation_id}/return:
+    patch:
+      tags: [reservations]
+      summary: Registrar la devolución de un ejemplar
+      description: >
+        Cierra la reserva con `returned_at` y devuelve el ejemplar a
+        `available`. Requiere ser el `librarian` de la sede que tiene el
+        ejemplar, o un `sysadmin`. Falla con 409 si la reserva ya está cerrada o
+        si nunca se retiró — en ese caso corresponde
+        `POST /reservations/{id}/cancel`.
+      operationId: markReservationReturned
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ReservationIdPath"
+      responses:
+        "200":
+          description: Devolución registrada
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReservationOut"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /reservations/{reservation_id}/pickup:
+    patch:
+      tags: [reservations]
+      summary: Marcar una reserva como retirada
+      description: >
+        Marca `picked_up = true` en la reserva y pasa el ejemplar físico
+        asociado a estado `loaned`. Requiere ser el `librarian` de la sede que
+        tiene el ejemplar, o un `sysadmin`. Falla con 409 si la reserva ya está
+        cerrada o ya había sido retirada.
+      operationId: markReservationPickedUp
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ReservationIdPath"
+      responses:
+        "200":
+          description: Reserva actualizada
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReservationOut"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /users:
+    post:
+      tags: [users]
+      summary: Crear un usuario (solo `AUTH_MODE=local`)
+      description: >
+        **Solo con `AUTH_MODE=local`**; con `AUTH_MODE=cognito` no existe (404): el lector se
+        registra en la Hosted UI y el trigger Post Confirmation crea su `User` (`customer`).
+
+
+        Auto-registro público: crea un usuario con rol `customer` fijo. Para
+        dar de alta `librarian`/`sysadmin` está `POST /users/staff`. Falla con
+        409 si el email ya está registrado, y con 429 si se superó el límite de
+        altas por IP.
+      operationId: createUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UserCreate"
+      responses:
+        "201":
+          description: Usuario creado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserOut"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+    get:
+      tags: [users]
+      summary: Listar usuarios
+      description: Solo `sysadmin`.
+      operationId: listUsers
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Lista de usuarios
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/UserOut"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /users/staff:
+    post:
+      tags: [users]
+      summary: Crear un usuario de personal (librarian/sysadmin)
+      description: >
+        Solo `sysadmin`. A diferencia de `POST /users`, permite elegir `role` y
+        asignar `library_id`. `library_id` solo es válido junto con
+        `role=librarian` (409 en cualquier otra combinación) y la sede tiene que
+        existir (404).
+
+
+        Con `AUTH_MODE=cognito` además crea la cuenta en el User Pool (sin email de
+        invitación y con el email ya verificado), y `password` es **temporal**: la Hosted UI
+        obliga a cambiarla en el primer ingreso. Si el `User` no se puede crear, la cuenta
+        de Cognito se borra. 422 si Cognito rechaza la contraseña por su política; 503 si
+        Cognito no contesta.
+      operationId: createStaffUser
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UserStaffCreate"
+      responses:
+        "201":
+          description: Usuario creado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserOut"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "503":
+          $ref: "#/components/responses/IdentityUnavailable"
+
+  /users/{user_id}:
+    get:
+      tags: [users]
+      summary: Obtener un usuario por id
+      description: Accesible para el propio usuario o para un `sysadmin`.
+      operationId: getUser
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+      responses:
+        "200":
+          description: Usuario encontrado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserOut"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      tags: [users]
+      summary: Actualizar un usuario
+      description: >
+        Actualización parcial; solo se aplican los campos enviados. Accesible
+        para el propio usuario o para un `sysadmin`, pero `role` y `library_id`
+        solo los puede tocar un `sysadmin` (403 en caso contrario). Bajar a un
+        `librarian` a otro rol limpia su `library_id` automáticamente.
+
+
+        Con `AUTH_MODE=cognito` la contraseña la guarda Cognito: enviar `password` da 422
+        y se cambia desde la Hosted UI («olvidé mi contraseña»). El resto de los campos
+        funciona igual, y un cambio de `role` o `library_id` vale desde el request
+        siguiente, sin volver a ingresar.
+      operationId: updateUser
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UserUpdate"
+      responses:
+        "200":
+          description: Usuario actualizado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserOut"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+    delete:
+      tags: [users]
+      summary: Eliminar un usuario
+      description: >
+        Accesible para el propio usuario o para un `sysadmin`. Con `AUTH_MODE=cognito`
+        borra primero la cuenta del User Pool y después el `User`: si lo segundo falla, la
+        persona ya no puede ingresar y reintentar el `DELETE` termina el trabajo. 503 si
+        Cognito no contesta (y entonces no se borró nada).
+      operationId: deleteUser
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+      responses:
+        "204":
+          description: Usuario eliminado
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/IdentityUnavailable"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        JWT enviado en el header `Authorization` con el prefijo `Bearer`. Quién lo emite
+        depende de `AUTH_MODE`:
+
+
+        - `local`: `POST /auth/login` (HS256, firmado con `JWT_SECRET`); el `sub` es el id
+          del usuario.
+
+        - `cognito`: el **access token** del User Pool, obtenido en la Hosted UI. Se valida
+          la firma RS256 contra el JWKS del pool, `iss`, `exp`, `token_use == "access"` y
+          `client_id`. Un **id token** se rechaza con 401: no es una credencial para llamar
+          APIs. Si el JWKS no se puede bajar, 503 (el token puede ser válido).
+
+
+        En los dos modos el usuario se recarga de la base en cada request: un token de un
+        usuario borrado da 401, y el rol y la sede son los de la base, no los del token.
+
+  parameters:
+    IsbnPath:
+      name: isbn
+      in: path
+      required: true
+      schema:
+        type: string
+    UserIdPath:
+      name: user_id
+      in: path
+      required: true
+      schema:
+        type: integer
+    LibraryIdPath:
+      name: library_id
+      in: path
+      required: true
+      schema:
+        type: integer
+    ReservationIdPath:
+      name: reservation_id
+      in: path
+      required: true
+      schema:
+        type: integer
+    AuthorIdPath:
+      name: author_id
+      in: path
+      required: true
+      schema:
+        type: integer
+    GenreIdPath:
+      name: genre_id
+      in: path
+      required: true
+      schema:
+        type: integer
+    PhysicalBookIdPath:
+      name: physical_book_id
+      in: path
+      required: true
+      schema:
+        type: integer
+
+  responses:
+    SearchUnavailable:
+      description: >
+        El índice de búsqueda no está configurado o no contesta. Solo afecta al listado, la
+        búsqueda y las ciudades del catálogo; el resto de la API sigue funcionando.
+        Conviene reintentar tras `Retry-After`.
+      headers:
+        Retry-After:
+          description: Segundos sugeridos antes de reintentar.
+          schema: { type: integer, example: 5 }
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              detail: { type: string, example: The search index is not reachable }
+    IdentityUnavailable:
+      description: >
+        Solo con `AUTH_MODE=cognito`: la API de administración de Cognito no contesta (alta
+        de personal, baja de usuarios). Conviene reintentar tras `Retry-After`.
+      headers:
+        Retry-After:
+          description: Segundos sugeridos antes de reintentar.
+          schema: { type: integer, example: 5 }
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorDetail"
+    NotFound:
+      description: El recurso solicitado no existe
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorDetail"
+    Unauthorized:
+      description: Falta el token, está vencido o es inválido
+      headers:
+        WWW-Authenticate:
+          schema:
+            type: string
+          example: Bearer
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorDetail"
+    Forbidden:
+      description: El usuario está autenticado pero no tiene permiso para esta operación
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorDetail"
+    Conflict:
+      description: La operación entra en conflicto con el estado actual del recurso
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorDetail"
+    TooManyRequests:
+      description: >
+        Se superó el límite de intentos de la ventana. Aplica a los endpoints públicos
+        sin sesión (`POST /auth/login` y `POST /users`), que solo existen con
+        `AUTH_MODE=local`: con Cognito, el bloqueo por intentos fallidos lo hace la Hosted UI. El header `Retry-After` indica
+        en cuántos segundos se libera. Si el cache está apagado o caído, el límite no se
+        aplica: es fail-open a propósito.
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+          example: 300
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorDetail"
+    PayloadTooLarge:
+      description: >
+        El cuerpo del request supera `MAX_REQUEST_BYTES` (1 MB por defecto). Se corta
+        mirando el `Content-Length`, antes de leer el cuerpo. Cualquier endpoint puede
+        responderlo; las portadas no pasan por acá, van directo a S3.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorDetail"
+    ValidationError:
+      description: Error de validación del payload/parámetros (FastAPI/Pydantic)
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/HTTPValidationError"
+
+  schemas:
+    ErrorDetail:
+      type: object
+      properties:
+        detail:
+          type: string
+      example:
+        detail: "Book 9780000000000 not found"
+
+    HTTPValidationError:
+      type: object
+      properties:
+        detail:
+          type: array
+          items:
+            type: object
+            properties:
+              loc:
+                type: array
+                items:
+                  oneOf:
+                    - type: string
+                    - type: integer
+              msg:
+                type: string
+              type:
+                type: string
+
+    LibraryBase:
+      type: object
+      description: >
+        Los `maxLength` replican el ancho de cada columna en la base: un texto más largo
+        da 422. Los campos de texto se guardan sin espacios al principio ni al final, y
+        los obligatorios no aceptan un valor en blanco. Los opcionales sí aceptan "":
+        es como se vacía un campo ya cargado.
+      required: [name, address, state, city]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 150
+        address:
+          type: string
+          minLength: 1
+          maxLength: 255
+        state:
+          type: string
+          minLength: 1
+          maxLength: 100
+        city:
+          type: string
+          minLength: 1
+          maxLength: 100
+        hours:
+          type: string
+          maxLength: 255
+          nullable: true
+        phone:
+          type: string
+          maxLength: 50
+          nullable: true
+        email:
+          type: string
+          maxLength: 255
+          nullable: true
+        website:
+          type: string
+          maxLength: 255
+          nullable: true
+
+    LibraryCreate:
+      allOf:
+        - $ref: "#/components/schemas/LibraryBase"
+
+    LibraryUpdate:
+      type: object
+      description: Todos los campos son opcionales; solo se aplican los enviados.
+      properties:
+        name:
+          type: string
+          nullable: true
+        address:
+          type: string
+          nullable: true
+        state:
+          type: string
+          nullable: true
+        city:
+          type: string
+          nullable: true
+        hours:
+          type: string
+          nullable: true
+        phone:
+          type: string
+          nullable: true
+        email:
+          type: string
+          nullable: true
+        website:
+          type: string
+          nullable: true
+
+    LibraryOut:
+      allOf:
+        - $ref: "#/components/schemas/LibraryBase"
+        - type: object
+          required: [id]
+          properties:
+            id:
+              type: integer
+
+    AuthorOut:
+      type: object
+      required: [id, name]
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+
+    AuthorCreate:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+
+    AuthorUpdate:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+          nullable: true
+
+    GenreOut:
+      type: object
+      required: [id, name]
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+
+    GenreCreate:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+
+    GenreUpdate:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+          nullable: true
+
+    BookBase:
+      type: object
+      required: [isbn, title, language]
+      properties:
+        isbn:
+          type: string
+          maxLength: 13
+        title:
+          type: string
+          minLength: 1
+          maxLength: 255
+        language:
+          type: string
+          minLength: 1
+          maxLength: 50
+        pages:
+          type: integer
+          minimum: 1
+          maximum: 50000
+          nullable: true
+        synopsis:
+          type: string
+          maxLength: 5000
+          nullable: true
+          description: >
+            La columna es un `TEXT` sin tope en la base; el límite lo pone el esquema
+            para que un POST no pueda escribir megabytes por fila.
+
+    BookOut:
+      allOf:
+        - $ref: "#/components/schemas/BookBase"
+        - type: object
+          properties:
+            authors:
+              type: array
+              items:
+                $ref: "#/components/schemas/AuthorOut"
+              default: []
+            genres:
+              type: array
+              items:
+                $ref: "#/components/schemas/GenreOut"
+              default: []
+            cover_url:
+              type: string
+              nullable: true
+              description: >
+                URL de lectura de la portada, derivada de la key guardada en la base.
+                `null` si el libro no tiene portada o si el almacenamiento está apagado.
+              example: https://cdn.bookup.example/covers/9780307474728/9bdc0148.jpg
+
+    CoverUploadRequest:
+      type: object
+      required: [content_type, size]
+      properties:
+        content_type:
+          type: string
+          enum: [image/jpeg, image/png, image/webp]
+        size:
+          type: integer
+          minimum: 1
+          description: Tamaño del archivo en bytes; el techo lo fija `COVER_MAX_BYTES`.
+
+    CoverUploadOut:
+      type: object
+      required: [upload_url, key, content_type, expires_in]
+      properties:
+        upload_url:
+          type: string
+          description: URL firmada para hacer `PUT` del archivo directo a S3.
+        key:
+          type: string
+          example: covers/9780307474728/9bdc0148c2ea4befa7697627a4a4f77b.png
+        content_type:
+          type: string
+          description: El `PUT` tiene que mandar exactamente este content-type; va firmado.
+        expires_in:
+          type: integer
+          description: Validez de la URL firmada, en segundos.
+
+    CoverAttach:
+      type: object
+      required: [key]
+      properties:
+        key:
+          type: string
+          description: La key que el browser terminó de subir.
+
+    BookPage:
+      type: object
+      required: [items, total, limit, offset]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/BookOut"
+        total:
+          type: integer
+          description: Total de libros del catálogo, no de la página.
+        limit:
+          type: integer
+        offset:
+          type: integer
+
+    BookCreate:
+      allOf:
+        - $ref: "#/components/schemas/BookBase"
+        - type: object
+          properties:
+            isbn:
+              type: string
+              description: ISBN-13 válido (13 dígitos y dígito verificador correcto).
+              pattern: "^[0-9]{13}$"
+            author_ids:
+              type: array
+              items:
+                type: integer
+              default: []
+            genre_ids:
+              type: array
+              items:
+                type: integer
+              default: []
+
+    BookUpdate:
+      type: object
+      description: >
+        Actualización parcial. `author_ids`/`genre_ids` reemplazan la lista
+        completa cuando se envían.
+      properties:
+        title:
+          type: string
+          nullable: true
+        language:
+          type: string
+          nullable: true
+        pages:
+          type: integer
+          nullable: true
+        synopsis:
+          type: string
+          nullable: true
+        author_ids:
+          type: array
+          items:
+            type: integer
+          nullable: true
+        genre_ids:
+          type: array
+          items:
+            type: integer
+          nullable: true
+
+    PhysicalBookStatus:
+      type: string
+      enum: [available, reserved, loaned, lost]
+
+    PhysicalBookOut:
+      type: object
+      required: [id, isbn, library_id, status]
+      properties:
+        id:
+          type: integer
+        isbn:
+          type: string
+        library_id:
+          type: integer
+        status:
+          $ref: "#/components/schemas/PhysicalBookStatus"
+
+    PhysicalBookCreate:
+      type: object
+      required: [isbn, library_id]
+      properties:
+        isbn:
+          type: string
+          description: ISBN-13 válido de un libro ya existente en el catálogo.
+          pattern: "^[0-9]{13}$"
+        library_id:
+          type: integer
+
+    PhysicalBookStatusUpdate:
+      type: object
+      required: [status]
+      properties:
+        status:
+          $ref: "#/components/schemas/PhysicalBookStatus"
+
+    LibraryAvailability:
+      type: object
+      required: [library, available_copies, physical_book_id]
+      properties:
+        library:
+          $ref: "#/components/schemas/LibraryOut"
+        available_copies:
+          type: integer
+        physical_book_id:
+          type: integer
+          description: Id representativo de un ejemplar físico disponible en esta sede, listo para reservar.
+
+    BookAvailability:
+      type: object
+      required: [book, libraries]
+      properties:
+        book:
+          $ref: "#/components/schemas/BookOut"
+        libraries:
+          type: array
+          items:
+            $ref: "#/components/schemas/LibraryAvailability"
+
+    UserRole:
+      type: string
+      enum: [customer, librarian, sysadmin]
+
+    UserOut:
+      type: object
+      required: [id, email, name, language, role]
+      properties:
+        id:
+          type: integer
+        email:
+          type: string
+        name:
+          type: string
+        language:
+          type: string
+        role:
+          $ref: "#/components/schemas/UserRole"
+        library_id:
+          type: integer
+          nullable: true
+          description: Sede a cargo (solo aplica a `librarian`).
+
+    UserCreate:
+      type: object
+      required: [email, password, name]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          minLength: 8
+          maxLength: 72
+          description: >
+            El techo son 72 **bytes** en UTF-8, que es todo lo que mira bcrypt: aceptar
+            más sería truncar en silencio y hacer equivalentes dos contraseñas distintas.
+        name:
+          type: string
+          minLength: 1
+          maxLength: 150
+        language:
+          type: string
+          minLength: 1
+          maxLength: 10
+          default: es
+
+    UserStaffCreate:
+      type: object
+      required: [email, password, name, role]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          minLength: 8
+          maxLength: 72
+          description: >
+            El techo son 72 **bytes** en UTF-8, que es todo lo que mira bcrypt: aceptar
+            más sería truncar en silencio y hacer equivalentes dos contraseñas distintas.
+        name:
+          type: string
+          minLength: 1
+          maxLength: 150
+        language:
+          type: string
+          minLength: 1
+          maxLength: 10
+          default: es
+        role:
+          $ref: "#/components/schemas/UserRole"
+        library_id:
+          type: integer
+          nullable: true
+          description: Sede a cargo; solo válido con `role=librarian`.
+
+    UserUpdate:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 150
+          nullable: true
+        language:
+          type: string
+          minLength: 1
+          maxLength: 10
+          nullable: true
+        password:
+          type: string
+          minLength: 8
+          maxLength: 72
+          nullable: true
+        role:
+          allOf:
+            - $ref: "#/components/schemas/UserRole"
+          nullable: true
+          description: Solo lo puede enviar un `sysadmin`.
+        library_id:
+          type: integer
+          nullable: true
+          description: Solo lo puede enviar un `sysadmin`, y solo con `role=librarian`.
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+
+    TokenOut:
+      type: object
+      required: [access_token, token_type, expires_in]
+      properties:
+        access_token:
+          type: string
+        token_type:
+          type: string
+          default: bearer
+        expires_in:
+          type: integer
+          description: Vigencia del token en segundos.
+
+    ReservationCreate:
+      type: object
+      required: [physical_book_id, expires_at]
+      description: >
+        El dueño de la reserva sale del token; `user_id` ya no se envía en el body.
+      properties:
+        physical_book_id:
+          type: integer
+        expires_at:
+          type: string
+          format: date-time
+          description: >
+            Futura, y a lo sumo a 365 días. Sin techo, un `expires_at` lejano retendría
+            el ejemplar indefinidamente.
+
+    ReservationUpdate:
+      type: object
+      properties:
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: >
+            Nuevo vencimiento: futuro y a lo sumo a 365 días, igual que en el alta.
+
+    ReservationOut:
+      type: object
+      required: [id, user_id, physical_book_id, reserved_at, expires_at, picked_up]
+      properties:
+        id:
+          type: integer
+        user_id:
+          type: integer
+        physical_book_id:
+          type: integer
+        reserved_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        picked_up:
+          type: boolean
+          description: Si el ejemplar fue retirado en la sede.
+        cancelled_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: >
+            Cuándo se dio de baja antes del retiro (por el usuario, por la sede
+            o por vencimiento). Null mientras la reserva siga abierta.
+        returned_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: >
+            Cuándo volvió el ejemplar retirado. Null mientras la reserva siga abierta.
+
+    ExpiredReservations:
+      type: object
+      required: [expired]
+      properties:
+        expired:
+          type: integer
+          description: Reservas vencidas en esta corrida.

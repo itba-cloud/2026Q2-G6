@@ -1,0 +1,291 @@
+import { useCallback, useEffect, useState } from "react";
+import { api } from "../api";
+import { useSession } from "../context/SessionContext";
+import { useConfirm } from "../context/ConfirmContext";
+import { useToast } from "../context/ToastContext";
+import { useCopyDetails } from "../hooks/useCopyDetails";
+import { describeError } from "../lib/errors";
+import { isOpen, isOpenParam, isOverdue, OPEN_FILTERS, type OpenFilter } from "../lib/reservations";
+import type { Library, Reservation } from "../types";
+import { ReservationManageModal } from "./ReservationManageModal";
+import { ReservationStatusBadge } from "./ReservationStatusBadge";
+import { ErrorBanner } from "./ErrorBanner";
+import { TableSkeleton } from "./Skeleton";
+
+const ALL_LIBRARIES = "all";
+
+export function LibrarianPanel() {
+  const confirm = useConfirm();
+  const { isSysadmin, myLibraryId } = useSession();
+  const toast = useToast();
+
+  const [filter, setFilter] = useState<OpenFilter>("open");
+  // Un `librarian` solo puede ver su sede (pedir otra da 403), así que el selector es
+  // solo para `sysadmin`.
+  const [libraryFilter, setLibraryFilter] = useState<string>(ALL_LIBRARIES);
+  const [libraries, setLibraries] = useState<Library[]>([]);
+  const [userNames, setUserNames] = useState<Record<number, string>>({});
+
+  const [reservations, setReservations] = useState<Reservation[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [busyId, setBusyId] = useState<number | null>(null);
+  const [managingId, setManagingId] = useState<number | null>(null);
+
+  const lookupCopy = useCopyDetails(reservations.map((reservation) => reservation.physical_book_id));
+
+  const selectedLibraryId =
+    libraryFilter === ALL_LIBRARIES ? undefined : Number(libraryFilter);
+
+  useEffect(() => {
+    if (!isSysadmin) return;
+    api.libraries.list().then(setLibraries).catch(() => undefined);
+    // Los nombres de usuario solo los puede listar un `sysadmin`: la API no le expone
+    // los datos de otros usuarios al personal de sede. Sin nombres, la columna
+    // «Usuario» directamente no se muestra.
+    api.users
+      .list()
+      .then((users) => setUserNames(Object.fromEntries(users.map((u) => [u.id, u.name]))))
+      .catch(() => undefined);
+  }, [isSysadmin]);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      setReservations(
+        await api.reservations.list({
+          is_open: isOpenParam(filter),
+          // El `librarian` queda fijado a su sede; el `sysadmin` elige.
+          library_id: isSysadmin ? selectedLibraryId : myLibraryId ?? undefined,
+        })
+      );
+    } catch (err) {
+      setError(describeError(err));
+    } finally {
+      setLoading(false);
+    }
+  }, [filter, isSysadmin, selectedLibraryId, myLibraryId]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  /**
+   * Toda acción sobre una reserva: bloquea el diálogo, recarga y reporta por toast.
+   * Si sale bien cierra el modal; si falla lo deja abierto para reintentar.
+   */
+  const runAction = async (
+    reservationId: number,
+    action: () => Promise<unknown>,
+    successMessage: string,
+    conflictMessage: string
+  ) => {
+    setBusyId(reservationId);
+    try {
+      await action();
+      setManagingId(null);
+      toast.success(successMessage);
+      await load();
+    } catch (err) {
+      toast.error(err, { 409: conflictMessage });
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  /** Ficha de la reserva para el diálogo: confirmar a ciegas no sirve de nada. */
+  const detailsOf = (reservation: Reservation) => {
+    const { book, library } = lookupCopy(reservation.physical_book_id);
+    return [
+      { label: "Libro", value: book?.title ?? `Ejemplar #${reservation.physical_book_id}` },
+      { label: "Sede", value: library?.name ?? "—" },
+      ...(userNames[reservation.user_id]
+        ? [{ label: "Usuario", value: userNames[reservation.user_id] }]
+        : []),
+      { label: "Vence", value: new Date(reservation.expires_at).toLocaleDateString() },
+    ];
+  };
+
+  const markPickedUp = async (reservation: Reservation) => {
+    const confirmed = await confirm({
+      tone: "positive",
+      title: "Registrar el retiro",
+      message: "El ejemplar pasa a estar prestado a esta persona.",
+      details: detailsOf(reservation),
+      confirmLabel: "Marcar retirada",
+    });
+    if (!confirmed) return;
+
+    return runAction(
+      reservation.id,
+      () => api.reservations.markPickedUp(reservation.id),
+      "Retiro registrado: el ejemplar quedó prestado.",
+      "No se puede marcar el retiro: la reserva ya está cerrada o el ejemplar ya se había retirado."
+    );
+  };
+
+  const markReturned = async (reservation: Reservation) => {
+    const confirmed = await confirm({
+      tone: "positive",
+      title: "Registrar la devolución",
+      message: "El ejemplar vuelve al estante y queda disponible para otra persona.",
+      details: detailsOf(reservation),
+      confirmLabel: "Registrar devolución",
+    });
+    if (!confirmed) return;
+
+    return runAction(
+      reservation.id,
+      () => api.reservations.markReturned(reservation.id),
+      "Devolución registrada: el ejemplar volvió a estar disponible.",
+      "No se puede registrar la devolución: la reserva ya está cerrada o el ejemplar nunca se retiró (en ese caso corresponde cancelarla)."
+    );
+  };
+
+  const cancel = async (reservation: Reservation) => {
+    const confirmed = await confirm({
+      tone: "danger",
+      title: "Cancelar la reserva",
+      message:
+        "La reserva se cierra y el ejemplar vuelve a estar disponible. No se puede deshacer.",
+      details: detailsOf(reservation),
+      confirmLabel: "Cancelar reserva",
+      cancelLabel: "Volver",
+    });
+    if (!confirmed) return;
+
+    return runAction(
+      reservation.id,
+      () => api.reservations.cancel(reservation.id),
+      "Reserva cancelada: el ejemplar volvió a estar disponible.",
+      "No se puede cancelar: la reserva ya está cerrada o el ejemplar ya fue retirado (en ese caso corresponde registrar la devolución)."
+    );
+  };
+
+  const extend = (reservation: Reservation, date: string) =>
+    runAction(
+      reservation.id,
+      () => api.reservations.update(reservation.id, { expires_at: new Date(`${date}T23:59:59`).toISOString() }),
+      "Vencimiento actualizado.",
+      "No se puede extender: la reserva ya está cerrada o el ejemplar ya fue retirado."
+    );
+
+  const showLibraryColumn = isSysadmin && selectedLibraryId === undefined;
+  // Sin los nombres (todo rol que no sea `sysadmin`) la columna no aporta nada.
+  const showUserColumn = isSysadmin;
+  const managed = reservations.find((reservation) => reservation.id === managingId) ?? null;
+
+  return (
+    <div className="stack">
+      <h2>Panel bibliotecario</h2>
+
+      <div className="panel-toolbar">
+        <div className="segmented segmented-sm">
+          {OPEN_FILTERS.map(({ value, label }) => (
+            <button
+              key={value}
+              type="button"
+              className={filter === value ? "active" : ""}
+              onClick={() => setFilter(value)}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+
+        {isSysadmin && (
+          <label className="field field-inline">
+            Sede
+            <select value={libraryFilter} onChange={(event) => setLibraryFilter(event.target.value)}>
+              <option value={ALL_LIBRARIES}>Todas</option>
+              {libraries.map((library) => (
+                <option key={library.id} value={library.id}>
+                  {library.name}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
+      </div>
+
+      {/* Solo la carga del listado: los errores de cada acción salen por toast. */}
+      <ErrorBanner error={error} />
+
+      {loading ? (
+        <TableSkeleton />
+      ) : reservations.length === 0 ? (
+        <p className="empty">No hay reservas para mostrar.</p>
+      ) : (
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Libro</th>
+                {showLibraryColumn && <th>Sede</th>}
+                {showUserColumn && <th>Usuario</th>}
+                <th>Reservada</th>
+                <th>Vence</th>
+                <th>Estado</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {reservations.map((reservation) => {
+                const { book, library } = lookupCopy(reservation.physical_book_id);
+
+                return (
+                  <tr key={reservation.id}>
+                    <td>
+                      {book?.title ?? <span className="badge badge-neutral">#{reservation.physical_book_id}</span>}
+                    </td>
+                    {showLibraryColumn && <td>{library?.name ?? "—"}</td>}
+                    {showUserColumn && <td>{userNames[reservation.user_id] ?? "—"}</td>}
+                    <td>{new Date(reservation.reserved_at).toLocaleDateString()}</td>
+                    <td className={isOverdue(reservation) ? "overdue" : undefined}>
+                      {new Date(reservation.expires_at).toLocaleDateString()}
+                    </td>
+                    <td>
+                      <ReservationStatusBadge reservation={reservation} />
+                    </td>
+                    <td>
+                      {/* Una reserva cerrada no admite ninguna acción: sin botón. */}
+                      {isOpen(reservation) && (
+                        <div className="row-actions">
+                          <button
+                            className="btn btn-secondary btn-sm"
+                            onClick={() => setManagingId(reservation.id)}
+                          >
+                            Gestionar
+                          </button>
+                        </div>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {managed && (
+        <ReservationManageModal
+          reservation={managed}
+          bookTitle={
+            lookupCopy(managed.physical_book_id).book?.title ??
+            `Ejemplar #${managed.physical_book_id}`
+          }
+          libraryName={lookupCopy(managed.physical_book_id).library?.name ?? null}
+          userName={userNames[managed.user_id] ?? null}
+          submitting={busyId === managed.id}
+          onPickup={() => markPickedUp(managed)}
+          onReturn={() => markReturned(managed)}
+          onCancelReservation={() => cancel(managed)}
+          onExtend={(date) => extend(managed, date)}
+          onClose={() => setManagingId(null)}
+        />
+      )}
+    </div>
+  );
+}

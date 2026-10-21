@@ -6,7 +6,7 @@ No requirements.
 ## Providers
 
 | Name | Version |
-| ---- | ------- |
+|------|---------|
 | <a name="provider_archive"></a> [archive](#provider\_archive) | n/a |
 | <a name="provider_aws"></a> [aws](#provider\_aws) | n/a |
 
@@ -17,7 +17,7 @@ No modules.
 ## Resources
 
 | Name | Type |
-| ---- | ---- |
+|------|------|
 | [aws_apigatewayv2_api.bridge](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/apigatewayv2_api) | resource |
 | [aws_apigatewayv2_integration.bridge](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/apigatewayv2_integration) | resource |
 | [aws_apigatewayv2_route.bridge](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/apigatewayv2_route) | resource |
@@ -37,7 +37,7 @@ No modules.
 ## Inputs
 
 | Name | Description | Type | Default | Required |
-| ---- | ----------- | ---- | ------- | :------: |
+|------|-------------|------|---------|:--------:|
 | <a name="input_access_token_minutes"></a> [access\_token\_minutes](#input\_access\_token\_minutes) | n/a | `number` | n/a | yes |
 | <a name="input_api_package_hash"></a> [api\_package\_hash](#input\_api\_package\_hash) | n/a | `string` | n/a | yes |
 | <a name="input_api_package_zip"></a> [api\_package\_zip](#input\_api\_package\_zip) | n/a | `string` | n/a | yes |
@@ -53,7 +53,7 @@ No modules.
 ## Outputs
 
 | Name | Description |
-| ---- | ----------- |
+|------|-------------|
 | <a name="output_callback_url"></a> [callback\_url](#output\_callback\_url) | n/a |
 | <a name="output_client_id"></a> [client\_id](#output\_client\_id) | n/a |
 | <a name="output_cognito_domain"></a> [cognito\_domain](#output\_cognito\_domain) | Host de la Hosted UI (sin esquema). |

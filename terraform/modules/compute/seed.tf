@@ -23,7 +23,8 @@ resource "terraform_data" "seed" {
   triggers_replace = [var.seed_trigger]
 
   provisioner "local-exec" {
-    command = "${path.module}/run_seed.sh"
+    #command = "${path.module}/run_seed.sh"
+    command = "bash ${path.module}/run_seed.sh"
     environment = {
       REGION          = var.region
       CLUSTER         = var.cluster_name

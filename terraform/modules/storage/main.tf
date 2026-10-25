@@ -22,7 +22,8 @@ resource "terraform_data" "bucket" {
   }
 
   provisioner "local-exec" {
-    command = "${path.module}/bucket.sh create"
+    # command = "${path.module}/bucket.sh create"
+    command = "bash ${path.module}/bucket.sh create"
     environment = {
       BUCKET = self.input.name
       REGION = self.input.region
@@ -31,7 +32,8 @@ resource "terraform_data" "bucket" {
 
   provisioner "local-exec" {
     when    = destroy
-    command = "${path.module}/bucket.sh delete"
+    # command = "${path.module}/bucket.sh delete"
+    command = "bash ${path.module}/bucket.sh delete"
     environment = {
       BUCKET        = self.input.name
       REGION        = self.input.region

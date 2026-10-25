@@ -20,7 +20,8 @@ resource "terraform_data" "build" {
   ]
 
   provisioner "local-exec" {
-    command = "${path.module}/build.sh"
+    command = "bash ${path.module}/build.sh"
+    # command = "${path.module}/build.sh"
     environment = {
       SOURCE_DIR     = var.source_dir
       BUILD_DIR      = local.build_dir

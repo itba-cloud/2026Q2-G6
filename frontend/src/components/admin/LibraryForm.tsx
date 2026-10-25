@@ -1,0 +1,142 @@
+import { useState, type FormEvent } from "react";
+import { api } from "../../api";
+import { useToast } from "../../context/ToastContext";
+import type { Library } from "../../types";
+import { LIMITS } from "../../lib/limits";
+import { ErrorBanner } from "../ErrorBanner";
+
+interface Props {
+  /** `undefined` = alta (solo `sysadmin`); con una sede = edición. */
+  library?: Library;
+  onSaved: () => void;
+  onCancel?: () => void;
+}
+
+export function LibraryForm({ library, onSaved, onCancel }: Props) {
+  const toast = useToast();
+  const editing = library !== undefined;
+
+  const [name, setName] = useState(library?.name ?? "");
+  const [address, setAddress] = useState(library?.address ?? "");
+  const [state, setState] = useState(library?.state ?? "");
+  const [city, setCity] = useState(library?.city ?? "");
+  const [hours, setHours] = useState(library?.hours ?? "");
+  const [phone, setPhone] = useState(library?.phone ?? "");
+  const [email, setEmail] = useState(library?.email ?? "");
+  const [website, setWebsite] = useState(library?.website ?? "");
+
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<unknown>(null);
+
+  const handleSubmit = async (event: FormEvent) => {
+    event.preventDefault();
+    setSubmitting(true);
+    setError(null);
+    try {
+      // Los opcionales van como "" y no como null: en el PATCH la API **ignora** los
+      // campos enviados en null, así que mandar null nunca borraría un valor viejo.
+      const fields = { name, address, state, city, hours, phone, email, website };
+
+      const saved = editing
+        ? await api.libraries.update(library.id, fields)
+        : await api.libraries.create(fields);
+      toast.success(editing ? `Sede «${saved.name}» actualizada.` : `Sede «${saved.name}» creada.`);
+      onSaved();
+    } catch (err) {
+      setError(err);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <form className="card form" onSubmit={handleSubmit}>
+      <ErrorBanner error={error} />
+
+      <label>
+        Nombre
+        <input
+          value={name}
+          onChange={(event) => setName(event.target.value)}
+          maxLength={LIMITS.library.name}
+          required
+        />
+      </label>
+      <label>
+        Dirección
+        <input
+          value={address}
+          onChange={(event) => setAddress(event.target.value)}
+          maxLength={LIMITS.library.address}
+          required
+        />
+      </label>
+      <label>
+        Ciudad
+        <input
+          value={city}
+          onChange={(event) => setCity(event.target.value)}
+          maxLength={LIMITS.library.city}
+          required
+        />
+      </label>
+      <label>
+        Provincia
+        <input
+          value={state}
+          onChange={(event) => setState(event.target.value)}
+          maxLength={LIMITS.library.state}
+          required
+        />
+      </label>
+      <label>
+        Horarios
+        <input
+          value={hours}
+          onChange={(event) => setHours(event.target.value)}
+          maxLength={LIMITS.library.hours}
+          placeholder="Opcional. Ej: L-V 9 a 18"
+        />
+      </label>
+      <label>
+        Teléfono
+        <input
+          value={phone}
+          onChange={(event) => setPhone(event.target.value)}
+          maxLength={LIMITS.library.phone}
+          placeholder="Opcional"
+        />
+      </label>
+      <label>
+        Email
+        <input
+          type="email"
+          value={email}
+          onChange={(event) => setEmail(event.target.value)}
+          maxLength={LIMITS.library.email}
+          placeholder="Opcional"
+        />
+      </label>
+      <label>
+        Sitio web
+        <input
+          value={website}
+          onChange={(event) => setWebsite(event.target.value)}
+          maxLength={LIMITS.library.website}
+          placeholder="Opcional"
+        />
+      </label>
+
+      <div className="actions">
+        {onCancel && (
+          <button type="button" className="btn btn-secondary" onClick={onCancel} disabled={submitting}>
+            Cancelar
+          </button>
+        )}
+        <button type="submit" className="btn btn-primary" disabled={submitting}>
+          {submitting ? "Guardando..." : editing ? "Guardar cambios" : "Crear sede"}
+        </button>
+      </div>
+    </form>
+  );
+}

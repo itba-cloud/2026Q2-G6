@@ -40,7 +40,8 @@ resource "terraform_data" "image" {
   triggers_replace = [local.image_uri]
 
   provisioner "local-exec" {
-    command = "${path.module}/push_image.sh"
+    command = "bash ${path.module}/push_image.sh"
+    # command = "${path.module}/push_image.sh"
     environment = {
       REGION     = var.region
       REGISTRY   = split("/", aws_ecr_repository.api.repository_url)[0]

@@ -1,0 +1,40 @@
+
+name: Test State Bucket
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: us-east-1
+
+      - name: Create and verify bucket
+        shell: bash
+        run: |
+          set -e
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          BUCKET="bookup-tfstate-${ACCOUNT_ID}"
+
+          echo "Account: $ACCOUNT_ID"
+          echo "Bucket: $BUCKET"
+
+          if ! aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+            echo "Bucket unavailable; attempting creation"
+            aws s3api create-bucket \
+              --bucket "$BUCKET" \
+              --region us-east-1
+          fi
+
+          echo "Verifying bucket immediately after creation"
+          aws s3api head-bucket --bucket "$BUCKET"
+          aws s3api get-bucket-location --bucket "$BUCKET"
+
+          echo "Bucket verification succeeded"
